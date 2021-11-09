@@ -4,7 +4,7 @@
 @FilePath: utils.py
 @Author: Xu Mingyu
 @Date: 2021-11-06 14:28:33
-@LastEditTime: 2021-11-07 13:46:02
+@LastEditTime: 2021-11-09 15:33:42
 @Description: 
 @Copyright 2021 Xu Mingyu, All Rights Reserved. 
 """
@@ -15,7 +15,6 @@ import torch
 from torch.utils.data import DataLoader,Dataset
 from torch.optim.lr_scheduler import _LRScheduler
 
-from tqdm.notebook import tqdm
 from PIL import Image
 import warnings
 
@@ -42,10 +41,9 @@ class ShopeeTrainDataset(Dataset):
 
 
 class ShopeeImageDataset(Dataset):
-    def __init__(self, dataset, transform=None, train=True):
+    def __init__(self, dataset, transform=None):
         self.dataset = dataset
         self.transform = transform
-        self.train = train
     
     def __len__(self):
         return self.dataset.shape[0]
@@ -55,22 +53,20 @@ class ShopeeImageDataset(Dataset):
         image = Image.open(image_path).convert('RGB')
         if self.transform:
             image = self.transform(image)
-        if self.train:
-            label_group = self.dataset.label_group.iloc[index]
-            return image, label_group
-        else:
-            return image
+
+        return image
 
 class ShopeeScheduler(_LRScheduler):
     def __init__(self, optimizer, lr_start=5e-6, lr_max=1e-5,
-                 lr_min=1e-6, lr_ramp_ep=5, lr_sus_ep=0, lr_decay=0.4,
+                 lr_min=1e-6, lr_warmup_ep=5, lr_sus_ep=0, lr_decay=0.4, step_size=1,
                  last_epoch=-1):
         self.lr_start = lr_start
         self.lr_max = lr_max
         self.lr_min = lr_min
-        self.lr_ramp_ep = lr_ramp_ep
+        self.lr_ramp_ep = lr_warmup_ep
         self.lr_sus_ep = lr_sus_ep
         self.lr_decay = lr_decay
+        self.step_size = step_size
         super(ShopeeScheduler, self).__init__(optimizer, last_epoch)
         
     def get_lr(self):
@@ -96,7 +92,7 @@ class ShopeeScheduler(_LRScheduler):
             lr = self.lr_max
         else:
             lr = ((self.lr_max - self.lr_min) * self.lr_decay**
-                  (self.last_epoch - self.lr_ramp_ep - self.lr_sus_ep) + 
+                  ((self.last_epoch - self.lr_ramp_ep - self.lr_sus_ep + self.step_size - 1) // self.step_size) + 
                   self.lr_min)
         return lr
 
@@ -128,7 +124,7 @@ def DistancePredict(df, features, threshold = 0.9, chunk = 1024, max_preds=50, d
     predict = []
     n = (features.size(0) + chunk - 1) // chunk
     with torch.no_grad():
-        for i in tqdm(range(n)):
+        for i in range(n):
             a = i*chunk
             b = (i+1)*chunk
             b = min(b, features.size(0))
@@ -171,7 +167,41 @@ def get_metric(target, predict):
     f1_score = tmp.apply(lambda row: f1(row['target'], row["predict"]),axis=1)
     precision_score = tmp.apply(lambda row: precision(row['target'], row["predict"]),axis=1)
     recall_score = tmp.apply(lambda row: recall(row['target'], row["predict"]),axis=1)
-    print("Mean F1: {:f}".format(f1_score.mean()))
-    print("Mean Precision: {:f}".format(precision_score.mean()))
-    print("Mean Recall: {:f}".format(recall_score.mean()))
+    #print("Mean F1: {:f}".format(f1_score.mean()))
+    #print("Mean Precision: {:f}".format(precision_score.mean()))
+    #print("Mean Recall: {:f}".format(recall_score.mean()))
     return f1_score.mean(), precision_score.mean(), recall_score.mean()
+
+def validate(feature, threshold, df):
+    pred = DistancePredict(df, feature, threshold= threshold)
+    df["pred"] = pred
+    f1, prec, rec = get_metric(df["target"], df["pred"])
+    return f1, prec, rec
+
+def NDCG(features, df, chunk=1024):
+    df = df.reset_index()
+    index_group_dict = df.groupby("label_group").index.agg("unique").to_dict()
+
+    ndcg = np.zeros(features.shape[0])
+    n = (features.size(0) + chunk - 1) // chunk
+    with torch.no_grad():
+        for i in range(n):
+            a = i*chunk
+            b = (i+1)*chunk
+            b = min(b, features.size(0))
+            x = features[a:b]
+            y = features
+
+            distance = cosine_dist(x,y).detach().cpu()
+            for k in range(b-a):
+                dist_desc = torch.sort(distance[k], descending=True)
+                dist_desc_idx = dist_desc[1].numpy()
+
+                target_index = index_group_dict[df.iloc[a+k].label_group]
+                target_pos_index = np.argwhere(np.in1d(dist_desc_idx, target_index)).flatten()
+
+                dcg = np.sum(1 / np.log2(target_pos_index + 2))
+                idcg = np.sum(1 / np.log2(np.arange(1, target_index.shape[0]+1) + 1))
+                ndcg[a+k] = dcg / idcg
+    
+    return ndcg
